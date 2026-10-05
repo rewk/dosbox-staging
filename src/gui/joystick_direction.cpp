@@ -72,3 +72,39 @@ uint8_t StickPositionToDirection(const int x, const int y,
 	};
 	return std::ranges::max_element(Spokes, {}, along)->direction;
 }
+
+std::optional<int> DiagonalIndex(const uint8_t direction)
+{
+	switch (direction) {
+	case SDL_HAT_RIGHTUP: return 0;
+	case SDL_HAT_RIGHTDOWN: return 1;
+	case SDL_HAT_LEFTDOWN: return 2;
+	case SDL_HAT_LEFTUP: return 3;
+	default: return {};
+	}
+}
+
+std::string_view DirectionName(const uint8_t direction)
+{
+	switch (direction) {
+	case SDL_HAT_UP: return "up";
+	case SDL_HAT_RIGHT: return "right";
+	case SDL_HAT_DOWN: return "down";
+	case SDL_HAT_LEFT: return "left";
+	case SDL_HAT_RIGHTUP: return "up-right";
+	case SDL_HAT_RIGHTDOWN: return "down-right";
+	case SDL_HAT_LEFTDOWN: return "down-left";
+	case SDL_HAT_LEFTUP: return "up-left";
+	default: return "centred";
+	}
+}
+
+ResolvedDirection ResolveDirection(const uint8_t direction,
+                                   const bool has_diagonal_binds)
+{
+	const auto diagonal_index = DiagonalIndex(direction);
+	if (diagonal_index && has_diagonal_binds) {
+		return {0, diagonal_index};
+	}
+	return {direction, {}};
+}

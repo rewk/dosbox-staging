@@ -186,3 +186,90 @@ TEST(JoystickDirection, InvalidPreviousGivesNearest)
 	EXPECT_EQ(direction_at(at_angle(0), Up | Down), Right);
 	EXPECT_EQ(direction_at(at_angle(90), 0xff), Up);
 }
+
+TEST(JoystickDirection, DiagonalIndexInClockwiseOrderFromUpRight)
+{
+	EXPECT_EQ(DiagonalIndex(RightUp), 0);
+	EXPECT_EQ(DiagonalIndex(RightDown), 1);
+	EXPECT_EQ(DiagonalIndex(LeftDown), 2);
+	EXPECT_EQ(DiagonalIndex(LeftUp), 3);
+}
+
+TEST(JoystickDirection, DiagonalIndicesFitNumDiagonals)
+{
+	for (const auto diagonal : {RightUp, RightDown, LeftDown, LeftUp}) {
+		const auto index = DiagonalIndex(diagonal);
+		ASSERT_TRUE(index.has_value());
+		EXPECT_GE(*index, 0);
+		EXPECT_LT(*index, NumDiagonals);
+	}
+}
+
+TEST(JoystickDirection, NoDiagonalIndexForCentredStraightOrInvalid)
+{
+	for (const auto direction : {Centred, Up, Right, Down, Left}) {
+		EXPECT_FALSE(DiagonalIndex(direction).has_value());
+	}
+	// Opposite directions together are not a diagonal
+	EXPECT_FALSE(DiagonalIndex(Up | Down).has_value());
+	EXPECT_FALSE(DiagonalIndex(Left | Right).has_value());
+	EXPECT_FALSE(DiagonalIndex(0xff).has_value());
+}
+
+TEST(JoystickDirection, DirectionNames)
+{
+	EXPECT_EQ(DirectionName(Up), "up");
+	EXPECT_EQ(DirectionName(Right), "right");
+	EXPECT_EQ(DirectionName(Down), "down");
+	EXPECT_EQ(DirectionName(Left), "left");
+	EXPECT_EQ(DirectionName(RightUp), "up-right");
+	EXPECT_EQ(DirectionName(RightDown), "down-right");
+	EXPECT_EQ(DirectionName(LeftDown), "down-left");
+	EXPECT_EQ(DirectionName(LeftUp), "up-left");
+}
+
+TEST(JoystickDirection, DirectionNameOfNonDirectionIsHarmless)
+{
+	EXPECT_EQ(DirectionName(Centred), "centred");
+	EXPECT_FALSE(DirectionName(Up | Down).empty());
+	EXPECT_FALSE(DirectionName(0xff).empty());
+}
+
+TEST(JoystickDirection, ResolveStraightPassesThroughRegardlessOfDiagonalBinds)
+{
+	for (const auto direction : {Up, Right, Down, Left}) {
+		for (const auto has_diagonal_binds : {false, true}) {
+			const auto resolved = ResolveDirection(direction,
+			                                       has_diagonal_binds);
+			EXPECT_EQ(resolved.straight, direction);
+			EXPECT_FALSE(resolved.diagonal_index.has_value());
+		}
+	}
+}
+
+TEST(JoystickDirection, ResolveDiagonalWithoutBindsActivatesBothStraights)
+{
+	for (const auto diagonal : {RightUp, RightDown, LeftDown, LeftUp}) {
+		const auto resolved = ResolveDirection(diagonal, false);
+		EXPECT_EQ(resolved.straight, diagonal);
+		EXPECT_FALSE(resolved.diagonal_index.has_value());
+	}
+}
+
+TEST(JoystickDirection, ResolveDiagonalWithBindsActivatesDiagonalOnly)
+{
+	for (const auto diagonal : {RightUp, RightDown, LeftDown, LeftUp}) {
+		const auto resolved = ResolveDirection(diagonal, true);
+		EXPECT_EQ(resolved.straight, Centred);
+		EXPECT_EQ(resolved.diagonal_index, DiagonalIndex(diagonal));
+	}
+}
+
+TEST(JoystickDirection, ResolveCentredActivatesNothing)
+{
+	for (const auto has_diagonal_binds : {false, true}) {
+		const auto resolved = ResolveDirection(Centred, has_diagonal_binds);
+		EXPECT_EQ(resolved.straight, Centred);
+		EXPECT_FALSE(resolved.diagonal_index.has_value());
+	}
+}

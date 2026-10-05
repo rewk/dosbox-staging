@@ -5,6 +5,7 @@
 #include "dosbox.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cctype>
 #include <charconv>
@@ -498,6 +499,7 @@ static struct {
 
 
 class CJAxisBind;
+class CJStickDiagonalBind;
 class CJButtonBind;
 class CJHatBind;
 
@@ -533,6 +535,48 @@ private:
 	CBindGroup *group;
 	int axis;
 	bool positive;
+};
+
+class CJStickDiagonalBind final : public CBind {
+public:
+	CJStickDiagonalBind(CBindList* _list, CBindGroup* _group, const int _x_axis,
+	                    const int _y_axis, const uint8_t _direction)
+	        : CBind(_list),
+	          group(_group),
+	          x_axis(_x_axis),
+	          y_axis(_y_axis),
+	          direction(_direction)
+	{}
+
+	CJStickDiagonalBind(const CJStickDiagonalBind&)            = delete;
+	CJStickDiagonalBind& operator=(const CJStickDiagonalBind&) = delete;
+
+	std::string GetConfigName() const override
+	{
+		return format_str("%s diagonal %d %d %d",
+		                  group->ConfigStart(),
+		                  x_axis,
+		                  y_axis,
+		                  direction);
+	}
+
+	std::string GetBindName() const override
+	{
+		char buf[MaxBindNameLength];
+		safe_sprintf(buf,
+		             "%s Axes %d/%d %s",
+		             group->BindStart(),
+		             x_axis,
+		             y_axis,
+		             std::string(DirectionName(direction)).c_str());
+		return buf;
+	}
+
+private:
+	CBindGroup* group = nullptr;
+	int x_axis        = 0;
+	int y_axis        = 0;
+	uint8_t direction = 0;
 };
 
 class CJButtonBind final : public CBind {
@@ -571,18 +615,11 @@ public:
 		  hat(_hat),
 		  dir(_dir)
 	{
-		// TODO this code allows to bind only a single hat position, but
-		// perhaps we should allow 8-way positioning?
-		if (dir & SDL_HAT_UP)
-			dir = SDL_HAT_UP;
-		else if (dir & SDL_HAT_RIGHT)
-			dir=SDL_HAT_RIGHT;
-		else if (dir & SDL_HAT_DOWN)
-			dir=SDL_HAT_DOWN;
-		else if (dir & SDL_HAT_LEFT)
-			dir=SDL_HAT_LEFT;
-		else
+		const auto is_straight = dir == SDL_HAT_UP || dir == SDL_HAT_RIGHT ||
+		                         dir == SDL_HAT_DOWN || dir == SDL_HAT_LEFT;
+		if (!is_straight && !DiagonalIndex(dir)) {
 			E_Exit("MAPPER:JOYSTICK:Invalid hat position");
+		}
 	}
 
 	CJHatBind(const CJHatBind&) = delete; // prevent copy
@@ -597,11 +634,11 @@ public:
 	std::string GetBindName() const override
 	{
 		char buf[MaxBindNameLength];
-		safe_sprintf(buf, "%s Hat %" PRIu8 " %s", group->BindStart(), hat,
-		             ((dir == SDL_HAT_UP)      ? "up"
-		              : (dir == SDL_HAT_RIGHT) ? "right"
-		              : (dir == SDL_HAT_DOWN)  ? "down"
-		                                       : "left"));
+		safe_sprintf(buf,
+		             "%s Hat %" PRIu8 " %s",
+		             group->BindStart(),
+		             hat,
+		             std::string(DirectionName(dir)).c_str());
 		return buf;
 	}
 
@@ -630,6 +667,9 @@ static void set_joystick_led(SDL_Joystick* joystick, const Rgb888& color)
 	// apply the color
 	SDL_SetJoystickLED(joystick, color.red, color.green, color.blue);
 }
+
+static bool is_binding_on_off_event();
+static bool has_usable_bind(const CBindList& list);
 
 // Returns the axis number of a gamepad mapping field in the format
 // "<field>a<axis number>", e.g. "leftx:a0"
@@ -737,6 +777,10 @@ public:
 
 		// Sticks bound to on/off events are read as a whole, like a hat
 		DetectSticks();
+
+		// Sized once: binds keep raw pointers to their list
+		stick_diagonal_lists.resize(sticks.size());
+		old_stick_diagonal.resize(sticks.size());
 		old_stick_direction.resize(sticks.size());
 	}
 
@@ -779,6 +823,11 @@ public:
 			auto hat = static_cast<uint8_t>(atoi(strip_word(buf)));
 			auto dir = static_cast<uint8_t>(atoi(strip_word(buf)));
 			bind = CreateHatBind(hat, dir);
+		} else if (!strcasecmp(type, "diagonal")) {
+			const auto x_axis = atoi(strip_word(buf));
+			const auto y_axis = atoi(strip_word(buf));
+			const auto dir = static_cast<uint8_t>(atoi(strip_word(buf)));
+			bind = CreateStickDiagonalBind(x_axis, y_axis, dir);
 		}
 		return bind;
 	}
@@ -792,6 +841,14 @@ public:
 				return nullptr;
 			if (axis_id >= axes)
 				return nullptr;
+
+			const auto stick_index = FindStickWithAxis(axis_id);
+			if (stick_index && is_binding_on_off_event()) {
+				return CreateStickEventBind(*stick_index,
+				                            axis_id,
+				                            axis_position);
+			}
+
 			if (abs(axis_position) < 25000)
 				return nullptr;
 
@@ -868,7 +925,9 @@ public:
 			digital_pos_axis[i] = position > AxisActivationThreshold;
 			digital_neg_axis[i] = position < -AxisActivationThreshold;
 		}
-		// Each stick's direction depends on the previous one
+		// Each stick's direction is read once per poll: it depends on
+		// the previous one
+		std::vector<ResolvedDirection> resolved_sticks(sticks.size());
 		for (size_t s = 0; s < sticks.size(); ++s) {
 			const auto& [x_axis, y_axis] = sticks[s];
 			const auto direction =
@@ -877,10 +936,27 @@ public:
 				                         old_stick_direction[s]);
 			old_stick_direction[s] = direction;
 
-			digital_pos_axis[x_axis] = direction & SDL_HAT_RIGHT;
-			digital_neg_axis[x_axis] = direction & SDL_HAT_LEFT;
-			digital_pos_axis[y_axis] = direction & SDL_HAT_DOWN;
-			digital_neg_axis[y_axis] = direction & SDL_HAT_UP;
+			const auto diagonal_index = DiagonalIndex(direction);
+			const auto has_diagonal_binds =
+			        diagonal_index &&
+			        has_usable_bind(
+			                stick_diagonal_lists[s][*diagonal_index]);
+			resolved_sticks[s] = ResolveDirection(direction,
+			                                      has_diagonal_binds);
+			const auto& resolved = resolved_sticks[s];
+
+			digital_pos_axis[x_axis] = resolved.straight & SDL_HAT_RIGHT;
+			digital_neg_axis[x_axis] = resolved.straight & SDL_HAT_LEFT;
+			digital_pos_axis[y_axis] = resolved.straight & SDL_HAT_DOWN;
+			digital_neg_axis[y_axis] = resolved.straight & SDL_HAT_UP;
+
+			// Release an old diagonal before pressing straight keys
+			auto& old_diagonal = old_stick_diagonal[s];
+			if (old_diagonal && old_diagonal != resolved.diagonal_index) {
+				DeactivateBindList(&stick_diagonal_lists[s][*old_diagonal],
+				                   true);
+				old_diagonal = {};
+			}
 		}
 		// Release keys before pressing others, whatever the axis order
 		for (int i = 0; i < axes; ++i) {
@@ -926,9 +1002,33 @@ public:
 				}
 			}
 		}
+		// Press a new diagonal after releasing its straight keys
+		for (size_t s = 0; s < sticks.size(); ++s) {
+			const auto diagonal_index = resolved_sticks[s].diagonal_index;
+			auto& old_diagonal = old_stick_diagonal[s];
+			if (diagonal_index && diagonal_index != old_diagonal) {
+				ActivateBindList(&stick_diagonal_lists[s][*diagonal_index],
+				                 32767,
+				                 true);
+				old_diagonal = diagonal_index;
+			}
+		}
 		for (int i = 0; i < hats; i++) {
 			assert(i < MAXHAT);
-			const uint8_t chat_state = SDL_GetJoystickHat(sdl_joystick, i);
+			const auto raw_hat_state = SDL_GetJoystickHat(sdl_joystick, i);
+			const auto diagonal_index = DiagonalIndex(raw_hat_state);
+			const auto has_diagonal_binds =
+			        diagonal_index &&
+			        has_usable_bind(HatDiagonalList(i, *diagonal_index));
+			const auto resolved = ResolveDirection(raw_hat_state,
+			                                       has_diagonal_binds);
+			const uint8_t chat_state = resolved.straight;
+
+			auto& old_diagonal = old_hat_diagonal[i];
+			if (old_diagonal && old_diagonal != resolved.diagonal_index) {
+				DeactivateBindList(&HatDiagonalList(i, *old_diagonal),
+				                   true);
+			}
 
 			// Release before pressing, so two directions never overlap
 			const auto old_state = old_hat_state[i];
@@ -946,6 +1046,14 @@ public:
 				}
 			}
 			old_hat_state[i] = chat_state;
+
+			if (resolved.diagonal_index &&
+			    resolved.diagonal_index != old_diagonal) {
+				ActivateBindList(&HatDiagonalList(i, *resolved.diagonal_index),
+				                 32767,
+				                 true);
+			}
+			old_diagonal = resolved.diagonal_index;
 		}
 	}
 
@@ -977,19 +1085,97 @@ private:
 			return nullptr;
 		assert(hat_lists);
 
+		if (const auto diagonal_index = DiagonalIndex(value)) {
+			// The hat number comes from the mapper file
+			if (hat >= MAXHAT) {
+				return nullptr;
+			}
+			return new CJHatBind(&HatDiagonalList(hat, *diagonal_index),
+			                     this,
+			                     hat,
+			                     value);
+		}
+
 		uint8_t hat_dir;
-		if (value & SDL_HAT_UP)
+		if (value == SDL_HAT_UP) {
 			hat_dir = 0;
-		else if (value & SDL_HAT_RIGHT)
+		} else if (value == SDL_HAT_RIGHT) {
 			hat_dir = 1;
-		else if (value & SDL_HAT_DOWN)
+		} else if (value == SDL_HAT_DOWN) {
 			hat_dir = 2;
-		else if (value & SDL_HAT_LEFT)
+		} else if (value == SDL_HAT_LEFT) {
 			hat_dir = 3;
-		else
+		} else {
 			return nullptr;
+		}
 		return new CJHatBind(&hat_lists[(hat << 2) + hat_dir],
 		                     this, hat, value);
+	}
+
+	CBindList& HatDiagonalList(const int hat, const int diagonal_index)
+	{
+		return hat_diagonal_lists[hat * NumDiagonals + diagonal_index];
+	}
+
+	std::optional<size_t> FindStickWithAxis(const int axis) const
+	{
+		for (size_t s = 0; s < sticks.size(); ++s) {
+			if (sticks[s].x_axis == axis || sticks[s].y_axis == axis) {
+				return s;
+			}
+		}
+		return {};
+	}
+
+	CBind* CreateStickDiagonalBind(const int x_axis, const int y_axis,
+	                               const uint8_t direction)
+	{
+		if (is_dummy) {
+			return nullptr;
+		}
+		const auto diagonal_index = DiagonalIndex(direction);
+		if (!diagonal_index) {
+			return nullptr;
+		}
+		for (size_t s = 0; s < sticks.size(); ++s) {
+			if (sticks[s].x_axis == x_axis && sticks[s].y_axis == y_axis) {
+				return new CJStickDiagonalBind(
+				        &stick_diagonal_lists[s][*diagonal_index],
+				        this,
+				        x_axis,
+				        y_axis,
+				        direction);
+			}
+		}
+		return nullptr;
+	}
+
+	// Binds the direction of the whole stick, the moved axis taking its
+	// position from the event
+	CBind* CreateStickEventBind(const size_t stick_index, const int axis,
+	                            const int position)
+	{
+		const auto& [x_axis, y_axis] = sticks[stick_index];
+
+		const auto x = (axis == x_axis)
+		                     ? position
+		                     : SDL_GetJoystickAxis(sdl_joystick, x_axis);
+		const auto y = (axis == y_axis)
+		                     ? position
+		                     : SDL_GetJoystickAxis(sdl_joystick, y_axis);
+		// From centred: the nearest direction, without hysteresis
+		const auto direction = StickPositionToDirection(x, y, SDL_HAT_CENTERED);
+
+		if (DiagonalIndex(direction)) {
+			return CreateStickDiagonalBind(x_axis, y_axis, direction);
+		}
+		switch (direction) {
+		case SDL_HAT_RIGHT: return CreateAxisBind(x_axis, true);
+		case SDL_HAT_LEFT: return CreateAxisBind(x_axis, false);
+		case SDL_HAT_DOWN: return CreateAxisBind(y_axis, true);
+		case SDL_HAT_UP: return CreateAxisBind(y_axis, false);
+		default: return nullptr;
+		}
 	}
 
 	const char * ConfigStart() override
@@ -1064,7 +1250,11 @@ private:
 	};
 	std::vector<StickAxes> sticks = {};
 
-	// Direction of each stick at the previous poll, for the hysteresis
+	// One list per diagonal of each stick, indexed like `sticks`
+	std::vector<std::array<CBindList, NumDiagonals>> stick_diagonal_lists = {};
+	std::vector<std::optional<int>> old_stick_diagonal = {};
+
+	// Raw direction of each stick, before resolving its diagonal binds
 	std::vector<uint8_t> old_stick_direction = {};
 
 protected:
@@ -1090,6 +1280,10 @@ protected:
 	bool old_pos_axis_state[MAXAXIS] = {};
 	bool old_neg_axis_state[MAXAXIS] = {};
 	uint8_t old_hat_state[MAXHAT] = {};
+
+	std::array<CBindList, MAXHAT * NumDiagonals> hat_diagonal_lists = {};
+	std::optional<int> old_hat_diagonal[MAXHAT]                     = {};
+
 	bool is_dummy;
 };
 
@@ -1371,13 +1565,31 @@ static struct CMapper {
 	std::string filename = "";
 } mapper;
 
+// Sticks are captured as a whole for on/off events only: continuous events
+// (emulated joystick axes) keep binding a single axis
+static bool is_binding_on_off_event()
+{
+	return mapper.aevent && mapper.aevent->IsTrigger();
+}
+
+// True if all the modifiers of the bind are currently held
+static bool is_bind_usable(const CBind* bind)
+{
+	return (bind->mods & mapper.mods) == bind->mods;
+}
+
+static bool has_usable_bind(const CBindList& list)
+{
+	return std::ranges::any_of(list, is_bind_usable);
+}
+
 // Returns the most specific modifier combination among the binds whose
 // modifiers are all currently held
 static Bitu get_valid_mods(const CBindList& list)
 {
 	Bitu valid_mods = 0;
 	for (const auto bind : list) {
-		if ((bind->mods & mapper.mods) == bind->mods) {
+		if (is_bind_usable(bind)) {
 			valid_mods = std::max(valid_mods, bind->mods);
 		}
 	}
