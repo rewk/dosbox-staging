@@ -7,13 +7,16 @@
 #include <algorithm>
 #include <cassert>
 #include <cctype>
+#include <charconv>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <list>
 #include <memory>
+#include <optional>
 #include <queue>
+#include <string_view>
 #include <vector>
 
 #include <SDL3/SDL.h>
@@ -24,6 +27,7 @@
 #include "gui/common.h"
 #include "gui/mapper.h"
 #include "gui/private/common.h"
+#include "gui/private/joystick_direction.h"
 #include "hardware/input/joystick.h"
 #include "hardware/input/keyboard.h"
 #include "hardware/input/mouse.h"
@@ -358,6 +362,7 @@ public:
 	}
 	virtual ~CBindGroup() = default;
 	void ActivateBindList(CBindList * list,Bits value,bool ev_trigger);
+	void ActivateAxisBindList(CBindList* list, Bits value, bool digital_active);
 	void DeactivateBindList(CBindList * list,bool ev_trigger);
 	virtual CBind * CreateConfigBind(char *&buf)=0;
 	virtual CBind * CreateEventBind(SDL_Event * event)=0;
@@ -625,6 +630,32 @@ static void set_joystick_led(SDL_Joystick* joystick, const Rgb888& color)
 	SDL_SetJoystickLED(joystick, color.red, color.green, color.blue);
 }
 
+// Returns the axis number of a gamepad mapping field in the format
+// "<field>a<axis number>", e.g. "leftx:a0"
+static std::optional<int> find_mapping_axis(const std::string_view mapping,
+                                            const std::string_view field)
+{
+	const auto field_pos = mapping.find(field);
+	if (field_pos == std::string_view::npos) {
+		return {};
+	}
+	auto value = mapping.substr(field_pos + field.size());
+	if (!value.starts_with('a')) {
+		// Not an axis
+		return {};
+	}
+	value.remove_prefix(1);
+
+	auto axis               = 0;
+	const auto [end, error] = std::from_chars(value.data(),
+	                                          value.data() + value.size(),
+	                                          axis);
+	if (error != std::errc() || axis < 0) {
+		return {};
+	}
+	return axis;
+}
+
 class CStickBindGroup : public CBindGroup {
 public:
 	CStickBindGroup([[maybe_unused]] int _stick_index, uint8_t _emustick, bool _dummy = false)
@@ -689,6 +720,10 @@ public:
 		// Trigger buttons that are actually analogue axis need special handling
 		// This function detects such triggers and sets the is_trigger variable for them
 		DetectTriggerButtons();
+
+		// Sticks bound to on/off events are read as a whole, like a hat
+		DetectSticks();
+		old_stick_direction.resize(sticks.size());
 	}
 
 	~CStickBindGroup() override
@@ -810,15 +845,40 @@ public:
 				old_button_state[i]=button_pressed[i];
 			}
 		}
+		Sint16 axis_positions[MAXAXIS] = {};
+		bool digital_pos_axis[MAXAXIS] = {};
+		bool digital_neg_axis[MAXAXIS] = {};
+		for (int i = 0; i < axes; ++i) {
+			const auto position = SDL_GetJoystickAxis(sdl_joystick, i);
+			axis_positions[i] = position;
+			digital_pos_axis[i] = position > AxisActivationThreshold;
+			digital_neg_axis[i] = position < -AxisActivationThreshold;
+		}
+		// Each stick's direction depends on the previous one
+		for (size_t s = 0; s < sticks.size(); ++s) {
+			const auto& [x_axis, y_axis] = sticks[s];
+			const auto direction =
+			        StickPositionToDirection(axis_positions[x_axis],
+				                         axis_positions[y_axis],
+				                         old_stick_direction[s]);
+			old_stick_direction[s] = direction;
+
+			digital_pos_axis[x_axis] = direction & SDL_HAT_RIGHT;
+			digital_neg_axis[x_axis] = direction & SDL_HAT_LEFT;
+			digital_pos_axis[y_axis] = direction & SDL_HAT_DOWN;
+			digital_neg_axis[y_axis] = direction & SDL_HAT_UP;
+		}
 		for (int i = 0; i < axes; i++) {
-			Sint16 caxis_pos = SDL_GetJoystickAxis(sdl_joystick, i);
+			Sint16 caxis_pos = axis_positions[i];
 			/* activate bindings for joystick position */
 			if (caxis_pos>1) {
 				if (old_neg_axis_state[i]) {
 					DeactivateBindList(&neg_axis_lists[i],false);
 					old_neg_axis_state[i] = false;
 				}
-				ActivateBindList(&pos_axis_lists[i],caxis_pos,false);
+				ActivateAxisBindList(&pos_axis_lists[i],
+				                     caxis_pos,
+				                     digital_pos_axis[i]);
 				old_pos_axis_state[i] = true;
 			} else if (caxis_pos<-1) {
 				if (old_pos_axis_state[i]) {
@@ -827,7 +887,9 @@ public:
 				}
 				if (caxis_pos!=-32768) caxis_pos=(Sint16)abs(caxis_pos);
 				else caxis_pos=32767;
-				ActivateBindList(&neg_axis_lists[i],caxis_pos,false);
+				ActivateAxisBindList(&neg_axis_lists[i],
+				                     caxis_pos,
+				                     digital_neg_axis[i]);
 				old_neg_axis_state[i] = true;
 			} else {
 				/* center */
@@ -922,33 +984,12 @@ private:
 			return "[missing joystick]";
 	}
 
-	void SetTriggerButtonFor(const char* button_name, const char* sdl_mapping)
+	void SetTriggerButtonFor(const std::string_view button_name,
+	                         const std::string_view sdl_mapping)
 	{
-		// Part of the string we care about is in the format of:
-		// "button_name" + ':' + single character button type (a for axis, b for button, h for hat) + axis number
-
-		const char* substring = strstr(sdl_mapping, button_name);
-		if (!substring) {
-			return;
-		}
-		substring += strlen(button_name);
-		if (*substring != 'a') {
-			// Not an axis so no need to do anything
-			return;
-		}
-		++substring;
-		if (!isdigit(*substring)) {
-			// Safety check, this means the string is an invalid format
-			return;
-		}
-		int axis_number = 0;
-		while (isdigit(*substring)) {
-			axis_number *= 10;
-			axis_number += *substring - '0';
-			++substring;
-		}
-		if (axis_number >= 0 && axis_number < MAXAXIS) {
-			is_trigger[axis_number] = true;
+		const auto axis = find_mapping_axis(sdl_mapping, button_name);
+		if (axis && *axis < MAXAXIS) {
+			is_trigger[*axis] = true;
 		}
 	}
 
@@ -963,7 +1004,47 @@ private:
 		SDL_free(sdl_mapping);
 	}
 
+	void AddStickFor(const std::string_view x_name, const std::string_view y_name,
+	                 const std::string_view sdl_mapping)
+	{
+		const auto x_axis = find_mapping_axis(sdl_mapping, x_name);
+		const auto y_axis = find_mapping_axis(sdl_mapping, y_name);
+		if (!x_axis || !y_axis || *x_axis == *y_axis) {
+			return;
+		}
+		if (*x_axis >= axes || *y_axis >= axes) {
+			return;
+		}
+		if (is_trigger[*x_axis] || is_trigger[*y_axis]) {
+			return;
+		}
+		sticks.push_back({*x_axis, *y_axis});
+	}
+
+	void DetectSticks()
+	{
+		auto sdl_mapping = SDL_GetGamepadMappingForID(stick_id);
+		if (!sdl_mapping) {
+			if (axes >= 2) {
+				sticks.push_back({0, 1});
+			}
+			return;
+		}
+		AddStickFor("leftx:", "lefty:", sdl_mapping);
+		AddStickFor("rightx:", "righty:", sdl_mapping);
+		SDL_free(sdl_mapping);
+	}
+
 	bool is_trigger[MAXAXIS] = {};
+
+	struct StickAxes {
+		int x_axis = 0;
+		int y_axis = 0;
+	};
+	std::vector<StickAxes> sticks = {};
+
+	// Direction of each stick at the previous poll, for the hysteresis
+	std::vector<uint8_t> old_stick_direction = {};
 
 protected:
 	CBindList *pos_axis_lists = nullptr;
@@ -1269,17 +1350,43 @@ static struct CMapper {
 	std::string filename = "";
 } mapper;
 
-void CBindGroup::ActivateBindList(CBindList * list,Bits value,bool ev_trigger) {
-	assert(list);
-	Bitu validmod=0;
-	CBindList_it it;
-	for (it = list->begin(); it != list->end(); ++it) {
-		if (((*it)->mods & mapper.mods) == (*it)->mods) {
-			if (validmod<(*it)->mods) validmod=(*it)->mods;
+// Returns the most specific modifier combination among the binds whose
+// modifiers are all currently held
+static Bitu get_valid_mods(const CBindList& list)
+{
+	Bitu valid_mods = 0;
+	for (const auto bind : list) {
+		if ((bind->mods & mapper.mods) == bind->mods) {
+			valid_mods = std::max(valid_mods, bind->mods);
 		}
 	}
-	for (it = list->begin(); it != list->end(); ++it) {
+	return valid_mods;
+}
+
+void CBindGroup::ActivateBindList(CBindList* list, Bits value, bool ev_trigger)
+{
+	assert(list);
+	const auto validmod = get_valid_mods(*list);
+	for (auto it = list->begin(); it != list->end(); ++it) {
 		if (validmod==(*it)->mods) (*it)->ActivateBind(value,ev_trigger);
+	}
+}
+
+// On/off events follow `digital_active`, continuous events get the raw value
+void CBindGroup::ActivateAxisBindList(CBindList* list, const Bits value,
+                                      const bool digital_active)
+{
+	assert(list);
+	const auto valid_mods = get_valid_mods(*list);
+	for (const auto bind : *list) {
+		if (bind->mods != valid_mods) {
+			continue;
+		}
+		if (bind->event->IsTrigger()) {
+			bind->ActivateBind(digital_active ? 32767 : 0, false);
+		} else {
+			bind->ActivateBind(value, false);
+		}
 	}
 }
 

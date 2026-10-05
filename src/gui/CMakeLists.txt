@@ -1,5 +1,6 @@
 target_sources(dosboxcommon PRIVATE
   clipboard.cpp
+  joystick_direction.cpp
   mapper.cpp
   sdl_gui.cpp
   titlebar.cpp
