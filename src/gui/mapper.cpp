@@ -363,6 +363,7 @@ public:
 	virtual ~CBindGroup() = default;
 	void ActivateBindList(CBindList * list,Bits value,bool ev_trigger);
 	void ActivateAxisBindList(CBindList* list, Bits value, bool digital_active);
+	void ReleaseAxisTriggerBinds(CBindList* list);
 	void DeactivateBindList(CBindList * list,bool ev_trigger);
 	virtual CBind * CreateConfigBind(char *&buf)=0;
 	virtual CBind * CreateEventBind(SDL_Event * event)=0;
@@ -656,6 +657,19 @@ static std::optional<int> find_mapping_axis(const std::string_view mapping,
 	return axis;
 }
 
+struct HatDirection {
+	uint8_t bit     = 0;
+	int list_offset = 0;
+};
+
+// Hat directions with the offset of their bind list
+constexpr HatDirection HatDirections[] = {
+        {   SDL_HAT_UP, 0},
+        {SDL_HAT_RIGHT, 1},
+        { SDL_HAT_DOWN, 2},
+        { SDL_HAT_LEFT, 3},
+};
+
 class CStickBindGroup : public CBindGroup {
 public:
 	CStickBindGroup([[maybe_unused]] int _stick_index, uint8_t _emustick, bool _dummy = false)
@@ -868,6 +882,15 @@ public:
 			digital_pos_axis[y_axis] = direction & SDL_HAT_DOWN;
 			digital_neg_axis[y_axis] = direction & SDL_HAT_UP;
 		}
+		// Release keys before pressing others, whatever the axis order
+		for (int i = 0; i < axes; ++i) {
+			if (!digital_pos_axis[i]) {
+				ReleaseAxisTriggerBinds(&pos_axis_lists[i]);
+			}
+			if (!digital_neg_axis[i]) {
+				ReleaseAxisTriggerBinds(&neg_axis_lists[i]);
+			}
+		}
 		for (int i = 0; i < axes; i++) {
 			Sint16 caxis_pos = axis_positions[i];
 			/* activate bindings for joystick position */
@@ -907,22 +930,20 @@ public:
 			assert(i < MAXHAT);
 			const uint8_t chat_state = SDL_GetJoystickHat(sdl_joystick, i);
 
-			/* activate binding if hat state has changed */
-			if ((chat_state & SDL_HAT_UP) != (old_hat_state[i] & SDL_HAT_UP)) {
-				if (chat_state & SDL_HAT_UP) ActivateBindList(&hat_lists[(i<<2)+0],32767,true);
-				else DeactivateBindList(&hat_lists[(i<<2)+0],true);
+			// Release before pressing, so two directions never overlap
+			const auto old_state = old_hat_state[i];
+			for (const auto& [bit, offset] : HatDirections) {
+				if ((old_state & bit) && !(chat_state & bit)) {
+					DeactivateBindList(&hat_lists[(i << 2) + offset],
+					                   true);
+				}
 			}
-			if ((chat_state & SDL_HAT_RIGHT) != (old_hat_state[i] & SDL_HAT_RIGHT)) {
-				if (chat_state & SDL_HAT_RIGHT) ActivateBindList(&hat_lists[(i<<2)+1],32767,true);
-				else DeactivateBindList(&hat_lists[(i<<2)+1],true);
-			}
-			if ((chat_state & SDL_HAT_DOWN) != (old_hat_state[i] & SDL_HAT_DOWN)) {
-				if (chat_state & SDL_HAT_DOWN) ActivateBindList(&hat_lists[(i<<2)+2],32767,true);
-				else DeactivateBindList(&hat_lists[(i<<2)+2],true);
-			}
-			if ((chat_state & SDL_HAT_LEFT) != (old_hat_state[i] & SDL_HAT_LEFT)) {
-				if (chat_state & SDL_HAT_LEFT) ActivateBindList(&hat_lists[(i<<2)+3],32767,true);
-				else DeactivateBindList(&hat_lists[(i<<2)+3],true);
+			for (const auto& [bit, offset] : HatDirections) {
+				if ((chat_state & bit) && !(old_state & bit)) {
+					ActivateBindList(&hat_lists[(i << 2) + offset],
+					                 32767,
+					                 true);
+				}
 			}
 			old_hat_state[i] = chat_state;
 		}
@@ -1386,6 +1407,17 @@ void CBindGroup::ActivateAxisBindList(CBindList* list, const Bits value,
 			bind->ActivateBind(digital_active ? 32767 : 0, false);
 		} else {
 			bind->ActivateBind(value, false);
+		}
+	}
+}
+
+// Releases the on/off events of an axis direction that went inactive
+void CBindGroup::ReleaseAxisTriggerBinds(CBindList* list)
+{
+	assert(list);
+	for (const auto bind : *list) {
+		if (bind->event->IsTrigger()) {
+			bind->ActivateBind(0, false);
 		}
 	}
 }
